@@ -1,0 +1,45 @@
+name: 微信读书同步到 Notion
+
+on:
+  workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: "*/3 * * * *"  # 每3分钟执行一次
+
+jobs:
+  sync:
+    name: 同步微信读书到 Notion
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # 设置超时时间，避免长时间运行
+    env:
+      # Notion 相关配置（必需）
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      # Notion 数据库 ID（可选，代码中有默认值）
+      BOOK_DATABASE_ID: ${{ secrets.BOOK_DATABASE_ID }}
+      NOTE_DATABASE_ID: ${{ secrets.NOTE_DATABASE_ID }}
+      INFO_DATABASE_ID: ${{ secrets.INFO_DATABASE_ID }}
+      # 微信读书 Cookie 配置（二选一）
+      WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
+      # Cookie Cloud 配置（如果使用 Cookie Cloud，可选）
+      CC_URL: ${{ secrets.CC_URL }}
+      CC_ID: ${{ secrets.CC_ID }}
+      CC_PASSWORD: ${{ secrets.CC_PASSWORD }}
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"  # 启用 pip 缓存，加快依赖安装速度
+      
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt
+      
+      - name: 同步微信读书到 Notion
+        run: |
+          python scripts/weread.py
+        continue-on-error: false  # 如果同步失败，停止 workflow
