@@ -48,12 +48,26 @@ def get_multi_select(names):
 
 
 def get_date(start):
-    return {
-        "date": {
-            "start": start,
-            "time_zone": "Asia/Shanghai",
+    """获取日期属性
+    
+    如果只提供日期（如 2024-01-01），不设置时区
+    如果提供日期时间（如 2024-01-01 12:00:00），设置时区
+    """
+    # 检查是否包含时间部分
+    if " " in start or "T" in start:
+        return {
+            "date": {
+                "start": start,
+                "time_zone": "Asia/Shanghai",
+            }
         }
-    }
+    else:
+        # 只有日期，不设置时区
+        return {
+            "date": {
+                "start": start,
+            }
+        }
 
 
 def get_icon(url):
@@ -120,3 +134,17 @@ def get_callout(content, style, colorStyle, reviewId):
             "color": color,
         },
     }
+
+
+def get_status(name):
+    """获取状态属性（用于status类型字段）"""
+    return {"status": {"name": name}}
+
+
+def get_relation(page_ids):
+    """获取关联属性（用于relation类型字段）
+    
+    Args:
+        page_ids: 页面ID列表
+    """
+    return {"relation": [{"id": page_id} for page_id in page_ids]}

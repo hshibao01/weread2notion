@@ -11,7 +11,6 @@ from http.cookies import SimpleCookie
 from datetime import datetime
 import hashlib
 from dotenv import load_dotenv
-import os
 from retrying import retry
 from utils import (
     get_callout,
@@ -27,8 +26,13 @@ from utils import (
     get_table_of_contents,
     get_title,
     get_url,
+    get_status,
+    get_relation,
 )
+
 load_dotenv()
+
+# 微信读书 API URLs
 WEREAD_URL = "https://weread.qq.com/"
 WEREAD_NOTEBOOKS_URL = "https://weread.qq.com/api/user/notebook"
 WEREAD_BOOKMARKLIST_URL = "https://weread.qq.com/web/book/bookmarklist"
@@ -36,6 +40,14 @@ WEREAD_CHAPTER_INFO = "https://weread.qq.com/web/book/chapterInfos"
 WEREAD_READ_INFO_URL = "https://weread.qq.com/web/book/readinfo"
 WEREAD_REVIEW_LIST_URL = "https://weread.qq.com/web/review/list"
 WEREAD_BOOK_INFO = "https://weread.qq.com/web/book/info"
+
+# Notion 数据库 ID (从环境变量或直接配置)
+# 书籍数据库: collection://2bbdd161-f4eb-8186-a76d-000b09f5ad17
+# 笔记数据库: collection://2bbdd161-f4eb-811b-a16a-000b87a9fd3b
+# 信息数据库: collection://2bbdd161-f4eb-8101-9bfd-000b703c3623
+BOOK_DATABASE_ID = os.getenv("BOOK_DATABASE_ID", "2bbdd161f4eb81e596d4c922546f1086")
+NOTE_DATABASE_ID = os.getenv("NOTE_DATABASE_ID", "2bbdd161f4eb813fa96deee0a105c004")
+INFO_DATABASE_ID = os.getenv("INFO_DATABASE_ID", "2bbdd161f4eb8141bf2ee02d3a908745")
 
 
 def parse_cookie_string(cookie_string):
@@ -48,26 +60,29 @@ def parse_cookie_string(cookie_string):
         cookiejar = cookiejar_from_dict(cookies_dict, cookiejar=None, overwrite=True)
     return cookiejar
 
+
 def refresh_token(exception):
     session.get(WEREAD_URL)
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000, retry_on_exception=refresh_token)
 def get_bookmark_list(bookId):
     """获取我的划线"""
     session.get(WEREAD_URL)
     params = dict(bookId=bookId)
     r = session.get(WEREAD_BOOKMARKLIST_URL, params=params)
     if r.ok:
-        print(r.json())
-        updated = r.json().get("updated")
-        updated = sorted(
-            updated,
-            key=lambda x: (x.get("chapterUid", 1), int(x.get("range").split("-")[0])),
-        )
-        return r.json()["updated"]
-    return None
+        updated = r.json().get("updated", [])
+        if updated:
+            updated = sorted(
+                updated,
+                key=lambda x: (x.get("chapterUid", 1), int(x.get("range", "0-0").split("-")[0] or 0)),
+            )
+        return updated
+    return []
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000, retry_on_exception=refresh_token)
 def get_read_info(bookId):
     session.get(WEREAD_URL)
     params = dict(bookId=bookId, readingDetail=1, readingBookIndex=1, finishedDate=1)
@@ -76,47 +91,41 @@ def get_read_info(bookId):
         return r.json()
     return None
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000, retry_on_exception=refresh_token)
 def get_bookinfo(bookId):
     """获取书的详情"""
     session.get(WEREAD_URL)
     params = dict(bookId=bookId)
     r = session.get(WEREAD_BOOK_INFO, params=params)
-    isbn = ""
     if r.ok:
         data = r.json()
-        isbn = data.get("isbn","")
-        newRating = data.get("newRating", 0) / 1000
-        return (isbn, newRating)
+        isbn = data.get("isbn", "")
+        newRating = data.get("newRating", 0) / 100  # 转换为0-10分制
+        intro = data.get("intro", "")
+        return (isbn, newRating, intro)
     else:
-        print(f"get {bookId} book info failed")
-        return ("", 0)
+        print(f"获取 {bookId} 书籍信息失败")
+        return ("", 0, "")
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000, retry_on_exception=refresh_token)
 def get_review_list(bookId):
-    """获取笔记"""
+    """获取笔记（点评）"""
     session.get(WEREAD_URL)
     params = dict(bookId=bookId, listType=11, mine=1, syncKey=0)
     r = session.get(WEREAD_REVIEW_LIST_URL, params=params)
-    reviews = r.json().get("reviews")
-    summary = list(filter(lambda x: x.get("review").get("type") == 4, reviews))
-    reviews = list(filter(lambda x: x.get("review").get("type") == 1, reviews))
-    reviews = list(map(lambda x: x.get("review"), reviews))
-    reviews = list(map(lambda x: {**x, "markText": x.pop("content")}, reviews))
-    return summary, reviews
+    if r.ok:
+        reviews = r.json().get("reviews", [])
+        # type=4 是书评/点评, type=1 是段落笔记
+        summary = list(filter(lambda x: x.get("review", {}).get("type") == 4, reviews))
+        notes = list(filter(lambda x: x.get("review", {}).get("type") == 1, reviews))
+        notes = list(map(lambda x: x.get("review"), notes))
+        return summary, notes
+    return [], []
 
 
-def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
-    filter = {"property": "BookId", "rich_text": {"equals": bookId}}
-    response = client.databases.query(database_id=database_id, filter=filter)
-    for result in response["results"]:
-        try:
-            client.blocks.delete(block_id=result["id"])
-        except Exception as e:
-            print(f"删除块时出错: {e}")
-
-@retry(stop_max_attempt_number=3, wait_fixed=5000,retry_on_exception=refresh_token)
+@retry(stop_max_attempt_number=3, wait_fixed=5000, retry_on_exception=refresh_token)
 def get_chapter_info(bookId):
     """获取章节信息"""
     session.get(WEREAD_URL)
@@ -133,70 +142,250 @@ def get_chapter_info(bookId):
     return None
 
 
-def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
-    """插入到notion"""
+def check_book_exists(bookId):
+    """检查书籍是否已存在，返回页面ID或None"""
+    # 在书籍简介字段中搜索bookId（我们会把bookId存在简介末尾）
+    filter = {
+        "property": "书籍简介",
+        "rich_text": {"contains": f"[BookID:{bookId}]"}
+    }
+    response = client.databases.query(database_id=BOOK_DATABASE_ID, filter=filter)
+    if response.get("results"):
+        return response["results"][0]["id"]
+    return None
+
+
+def check_note_exists(note_id):
+    """检查笔记是否已存在"""
+    # 笔记没有ID字段，我们用名称+日期来判断
+    return None
+
+
+def check_info_exists(highlight_text, book_name):
+    """检查划线是否已存在"""
+    # 通过名称精确匹配
+    filter = {
+        "property": "名称",
+        "title": {"equals": highlight_text[:100]}  # Notion标题有长度限制
+    }
+    response = client.databases.query(database_id=INFO_DATABASE_ID, filter=filter)
+    if response.get("results"):
+        return response["results"][0]["id"]
+    return None
+
+
+def insert_book_to_notion(book_name, book_id, cover, author, isbn, rating, intro, read_info):
+    """
+    插入书籍到书籍数据库
+    字段映射:
+    - 名称 (title) ← book_name
+    - 书籍作者 (text) ← author
+    - 书籍简介 (text) ← intro + [BookID:xxx]
+    - 书籍链接 (url) ← 微信读书链接
+    - 书籍封面 (file) ← cover
+    - 豆瓣评分 (number) ← rating (0-10)
+    - 状态 (status) ← 计划阅读/正在阅读/已经读完
+    - 添加日期 (date) ← 当前日期
+    - 读完日期 (date) ← finishedDate
+    """
     if not cover or not cover.startswith("http"):
         cover = "https://www.notion.so/icons/book_gray.svg"
-    parent = {"database_id": database_id, "type": "database_id"}
+    
+    # 在简介末尾添加BookID用于后续查找
+    book_intro = f"{intro}\n\n[BookID:{book_id}]" if intro else f"[BookID:{book_id}]"
+    
+    # 构建微信读书链接
+    weread_url = f"https://weread.qq.com/web/reader/{calculate_book_str_id(book_id)}"
+    
+    parent = {"database_id": BOOK_DATABASE_ID, "type": "database_id"}
     properties = {
-        "BookName": get_title(bookName),
-        "BookId": get_rich_text(bookId),
-        "ISBN": get_rich_text(isbn),
-        "URL": get_url(
-            f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}"
-        ),
-        "Author": get_rich_text(author),
-        "Sort": get_number(sort),
-        "Rating": get_number(rating),
-        "Cover": get_file(cover),
+        "名称": get_title(book_name),
+        "书籍作者": get_rich_text(author or ""),
+        "书籍简介": get_rich_text(book_intro),
+        "书籍链接": get_url(weread_url),
+        "书籍封面": get_file(cover),
+        "添加日期": get_date(datetime.now().strftime("%Y-%m-%d")),
     }
-    if categories != None:
-        properties["Categories"] = get_multi_select(categories)
-    read_info = get_read_info(bookId=bookId)
-    if read_info != None:
-        markedStatus = read_info.get("markedStatus", 0)
-        readingTime = read_info.get("readingTime", 0)
-        readingProgress = read_info.get("readingProgress", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}分"
-        properties["Status"] = get_select("读完" if markedStatus == 4 else "在读")
-        properties["ReadingTime"] = get_rich_text(format_time)
-        properties["Progress"] = get_number(readingProgress)
-        if "finishedDate" in read_info:
-            properties["Date"] = get_date(
-                datetime.utcfromtimestamp(read_info.get("finishedDate")).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-            )
-
+    
+    # 豆瓣评分
+    if rating and rating > 0:
+        properties["豆瓣评分"] = get_number(rating)
+    
+    # 阅读状态
+    if read_info:
+        marked_status = read_info.get("markedStatus", 0)
+        if marked_status == 4:
+            properties["状态"] = get_status("已经读完")
+            # 读完日期
+            if "finishedDate" in read_info:
+                finished_date = datetime.utcfromtimestamp(read_info.get("finishedDate")).strftime("%Y-%m-%d")
+                properties["读完日期"] = get_date(finished_date)
+        elif marked_status > 0:
+            properties["状态"] = get_status("正在阅读")
+        else:
+            properties["状态"] = get_status("计划阅读")
+    else:
+        properties["状态"] = get_status("计划阅读")
+    
     icon = get_icon(cover)
-    # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
-    id = response["id"]
-    return id
+    response = client.pages.create(parent=parent, icon=icon, cover=icon, properties=properties)
+    return response["id"]
+
+
+def update_book_in_notion(page_id, book_name, book_id, cover, author, isbn, rating, intro, read_info):
+    """更新已存在的书籍"""
+    if not cover or not cover.startswith("http"):
+        cover = "https://www.notion.so/icons/book_gray.svg"
+    
+    book_intro = f"{intro}\n\n[BookID:{book_id}]" if intro else f"[BookID:{book_id}]"
+    weread_url = f"https://weread.qq.com/web/reader/{calculate_book_str_id(book_id)}"
+    
+    properties = {
+        "名称": get_title(book_name),
+        "书籍作者": get_rich_text(author or ""),
+        "书籍简介": get_rich_text(book_intro),
+        "书籍链接": get_url(weread_url),
+        "书籍封面": get_file(cover),
+    }
+    
+    if rating and rating > 0:
+        properties["豆瓣评分"] = get_number(rating)
+    
+    if read_info:
+        marked_status = read_info.get("markedStatus", 0)
+        if marked_status == 4:
+            properties["状态"] = get_status("已经读完")
+            if "finishedDate" in read_info:
+                finished_date = datetime.utcfromtimestamp(read_info.get("finishedDate")).strftime("%Y-%m-%d")
+                properties["读完日期"] = get_date(finished_date)
+        elif marked_status > 0:
+            properties["状态"] = get_status("正在阅读")
+    
+    icon = get_icon(cover)
+    client.pages.update(page_id=page_id, icon=icon, cover=icon, properties=properties)
+    return page_id
+
+
+def insert_note_to_notion(note_content, book_page_id, chapter_title=None):
+    """
+    插入笔记到笔记数据库
+    字段映射:
+    - 名称 (title) ← note_content (截取前100字符作为标题)
+    - 日期 (date) ← 当前日期
+    - 分类 (status) ← 文献笔记
+    - 书籍 (relation) ← book_page_id
+    """
+    # 截取内容作为标题，最多100字符
+    title = note_content[:100] if len(note_content) > 100 else note_content
+    title = title.replace("\n", " ").strip()
+    
+    parent = {"database_id": NOTE_DATABASE_ID, "type": "database_id"}
+    properties = {
+        "名称": get_title(title),
+        "日期": get_date(datetime.now().strftime("%Y-%m-%d")),
+        "分类": get_status("文献笔记"),
+    }
+    
+    # 关联书籍
+    if book_page_id:
+        properties["书籍"] = get_relation([book_page_id])
+    
+    response = client.pages.create(parent=parent, properties=properties)
+    note_page_id = response["id"]
+    
+    # 如果内容较长，添加到页面内容中
+    if len(note_content) > 100:
+        children = []
+        if chapter_title:
+            children.append(get_heading(3, f"章节：{chapter_title}"))
+        
+        # 分段添加内容
+        for i in range(0, len(note_content), 2000):
+            children.append({
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": note_content[i:i+2000]}}]
+                }
+            })
+        
+        if children:
+            add_children(note_page_id, children)
+    
+    return note_page_id
+
+
+def insert_highlight_to_info(highlight_text, book_name, book_url, book_page_id, note_page_ids=None, chapter_title=None):
+    """
+    插入划线到信息数据库
+    字段映射:
+    - 名称 (title) ← highlight_text (截取前100字符)
+    - 类型 (select) ← 摘抄
+    - 状态 (status) ← 收集
+    - 网址 (url) ← book_url
+    - 创建日期 (date) ← 当前日期
+    - 笔记 (relation) ← note_page_ids
+    - 书籍 (relation) ← book_page_id (双向关联到书籍库，反向字段名为"信息")
+    """
+    # 截取内容作为标题
+    title = highlight_text[:100] if len(highlight_text) > 100 else highlight_text
+    title = title.replace("\n", " ").strip()
+    
+    parent = {"database_id": INFO_DATABASE_ID, "type": "database_id"}
+    properties = {
+        "名称": get_title(title),
+        "类型": get_select("摘抄"),
+        "状态": get_status("收集"),
+        "创建日期": get_date(datetime.now().strftime("%Y-%m-%d")),
+    }
+    
+    if book_url:
+        properties["网址"] = get_url(book_url)
+    
+    # 关联笔记
+    if note_page_ids:
+        properties["笔记"] = get_relation(note_page_ids)
+    
+    # 关联书籍（双向关联，信息库字段名"书籍"，书籍库反向字段名"信息"）
+    if book_page_id:
+        properties["书籍"] = get_relation([book_page_id])
+    
+    response = client.pages.create(parent=parent, properties=properties)
+    info_page_id = response["id"]
+    
+    # 添加完整内容到页面
+    children = []
+    if chapter_title:
+        children.append(get_heading(3, f"来源：{book_name} - {chapter_title}"))
+    else:
+        children.append(get_heading(3, f"来源：{book_name}"))
+    
+    # 分段添加划线内容
+    for i in range(0, len(highlight_text), 2000):
+        children.append({
+            "type": "quote",
+            "quote": {
+                "rich_text": [{"type": "text", "text": {"content": highlight_text[i:i+2000]}}],
+                "color": "default"
+            }
+        })
+    
+    if children:
+        add_children(info_page_id, children)
+    
+    return info_page_id
 
 
 def add_children(id, children):
+    """添加子块到页面"""
     results = []
     for i in range(0, len(children) // 100 + 1):
+        batch = children[i * 100 : (i + 1) * 100]
+        if not batch:
+            continue
         time.sleep(0.3)
-        response = client.blocks.children.append(
-            block_id=id, children=children[i * 100 : (i + 1) * 100]
-        )
-        results.extend(response.get("results"))
-    return results if len(results) == len(children) else None
-
-
-def add_grandchild(grandchild, results):
-    for key, value in grandchild.items():
-        time.sleep(0.3)
-        id = results[key].get("id")
-        client.blocks.children.append(block_id=id, children=[value])
+        response = client.blocks.children.append(block_id=id, children=batch)
+        results.extend(response.get("results", []))
+    return results
 
 
 def get_notebooklist():
@@ -205,93 +394,12 @@ def get_notebooklist():
     r = session.get(WEREAD_NOTEBOOKS_URL)
     if r.ok:
         data = r.json()
-        books = data.get("books")
+        books = data.get("books", [])
         books.sort(key=lambda x: x["sort"])
         return books
     else:
         print(r.text)
     return None
-
-
-def get_sort():
-    """获取database中的最新时间"""
-    filter = {"property": "Sort", "number": {"is_not_empty": True}}
-    sorts = [
-        {
-            "property": "Sort",
-            "direction": "descending",
-        }
-    ]
-    response = client.databases.query(
-        database_id=database_id, filter=filter, sorts=sorts, page_size=1
-    )
-    if len(response.get("results")) == 1:
-        return response.get("results")[0].get("properties").get("Sort").get("number")
-    return 0
-
-
-def get_children(chapter, summary, bookmark_list):
-    children = []
-    grandchild = {}
-    if chapter != None:
-        # 添加目录
-        children.append(get_table_of_contents())
-        d = {}
-        for data in bookmark_list:
-            chapterUid = data.get("chapterUid", 1)
-            if chapterUid not in d:
-                d[chapterUid] = []
-            d[chapterUid].append(data)
-        for key, value in d.items():
-            if key in chapter:
-                # 添加章节
-                children.append(
-                    get_heading(
-                        chapter.get(key).get("level"), chapter.get(key).get("title")
-                    )
-                )
-            for i in value:
-                markText = i.get("markText")
-                for j in range(0, len(markText) // 2000 + 1):
-                    children.append(
-                        get_callout(
-                            markText[j * 2000 : (j + 1) * 2000],
-                            i.get("style"),
-                            i.get("colorStyle"),
-                            i.get("reviewId"),
-                        )
-                    )
-                if i.get("abstract") != None and i.get("abstract") != "":
-                    quote = get_quote(i.get("abstract"))
-                    grandchild[len(children) - 1] = quote
-
-    else:
-        # 如果没有章节信息
-        for data in bookmark_list:
-            markText = data.get("markText")
-            for i in range(0, len(markText) // 2000 + 1):
-                children.append(
-                    get_callout(
-                        markText[i * 2000 : (i + 1) * 2000],
-                        data.get("style"),
-                        data.get("colorStyle"),
-                        data.get("reviewId"),
-                    )
-                )
-    if summary != None and len(summary) > 0:
-        children.append(get_heading(1, "点评"))
-        for i in summary:
-            content = i.get("review").get("content")
-            for j in range(0, len(content) // 2000 + 1):
-                children.append(
-                    get_callout(
-                        content[j * 2000 : (j + 1) * 2000],
-                        i.get("style"),
-                        i.get("colorStyle"),
-                        i.get("review").get("reviewId"),
-                    )
-                )
-    return children, grandchild
 
 
 def transform_id(book_id):
@@ -367,75 +475,142 @@ def get_cookie():
     if not cookie or not cookie.strip():
         raise Exception("没有找到cookie，请按照文档填写cookie")
     return cookie
+
+
+def sync_book(book_data):
+    """同步单本书籍及其划线、笔记"""
+    book = book_data.get("book")
+    title = book.get("title")
+    cover = book.get("cover", "").replace("/s_", "/t7_")
+    book_id = book.get("bookId")
+    author = book.get("author", "")
     
-
-
-def extract_page_id():
-    url = os.getenv("NOTION_PAGE")
-    if not url:
-        url = os.getenv("NOTION_DATABASE_ID")
-    if not url:
-        raise Exception("没有找到NOTION_PAGE，请按照文档填写")
-    # 正则表达式匹配 32 个字符的 Notion page_id
-    match = re.search(
-        r"([a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
-        url,
-    )
-    if match:
-        return match.group(0)
+    print(f"  📖 正在处理书籍: {title}")
+    
+    # 获取书籍详情
+    isbn, rating, intro = get_bookinfo(book_id)
+    read_info = get_read_info(book_id)
+    
+    # 检查书籍是否已存在
+    existing_book_id = check_book_exists(book_id)
+    if existing_book_id:
+        print(f"    ✓ 书籍已存在，更新中...")
+        book_page_id = update_book_in_notion(
+            existing_book_id, title, book_id, cover, author, isbn, rating, intro, read_info
+        )
     else:
-        raise Exception(f"获取NotionID失败，请检查输入的Url是否正确")
+        print(f"    + 创建新书籍...")
+        book_page_id = insert_book_to_notion(
+            title, book_id, cover, author, isbn, rating, intro, read_info
+        )
+    
+    # 构建微信读书链接
+    book_url = f"https://weread.qq.com/web/reader/{calculate_book_str_id(book_id)}"
+    
+    # 获取章节信息
+    chapter_info = get_chapter_info(book_id)
+    
+    # 获取划线列表
+    bookmark_list = get_bookmark_list(book_id)
+    print(f"    📝 发现 {len(bookmark_list)} 条划线")
+    
+    # 获取笔记（点评）
+    summary, notes = get_review_list(book_id)
+    print(f"    ✍️ 发现 {len(notes)} 条笔记, {len(summary)} 条书评")
+    
+    # 创建笔记页面（用于关联划线）
+    note_page_ids = []
+    
+    # 处理书评（summary）- 作为笔记
+    for item in summary:
+        review = item.get("review", {})
+        content = review.get("content", "")
+        if content:
+            print(f"    + 添加书评笔记...")
+            note_id = insert_note_to_notion(content, book_page_id, chapter_title="书评")
+            note_page_ids.append(note_id)
+            time.sleep(0.3)
+    
+    # 处理段落笔记 - 作为笔记
+    for note in notes:
+        content = note.get("content", "")
+        chapter_uid = note.get("chapterUid", 1)
+        chapter_title = None
+        if chapter_info and chapter_uid in chapter_info:
+            chapter_title = chapter_info[chapter_uid].get("title", "")
+        
+        if content:
+            print(f"    + 添加段落笔记...")
+            note_id = insert_note_to_notion(content, book_page_id, chapter_title=chapter_title)
+            note_page_ids.append(note_id)
+            time.sleep(0.3)
+    
+    # 处理划线 - 作为信息
+    highlight_count = 0
+    for bookmark in bookmark_list:
+        mark_text = bookmark.get("markText", "")
+        if not mark_text:
+            continue
+        
+        chapter_uid = bookmark.get("chapterUid", 1)
+        chapter_title = None
+        if chapter_info and chapter_uid in chapter_info:
+            chapter_title = chapter_info[chapter_uid].get("title", "")
+        
+        # 检查是否已存在
+        if check_info_exists(mark_text, title):
+            continue
+        
+        print(f"    + 添加划线到信息库...")
+        insert_highlight_to_info(
+            mark_text, title, book_url, book_page_id, 
+            note_page_ids=note_page_ids if note_page_ids else None,
+            chapter_title=chapter_title
+        )
+        highlight_count += 1
+        time.sleep(0.3)
+    
+    print(f"    ✓ 完成! 新增 {highlight_count} 条划线")
+    return book_page_id
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="同步微信读书到Notion")
+    parser.add_argument("--all", action="store_true", help="同步所有书籍，忽略已同步状态")
     options = parser.parse_args()
+    
+    print("=" * 50)
+    print("微信读书 → Notion 同步工具")
+    print("=" * 50)
+    print(f"书籍数据库: {BOOK_DATABASE_ID}")
+    print(f"笔记数据库: {NOTE_DATABASE_ID}")
+    print(f"信息数据库: {INFO_DATABASE_ID}")
+    print("=" * 50)
+    
     weread_cookie = get_cookie()
-    database_id = extract_page_id()
     notion_token = os.getenv("NOTION_TOKEN")
+    
     session = requests.Session()
     session.cookies = parse_cookie_string(weread_cookie)
     client = Client(auth=notion_token, log_level=logging.ERROR)
+    
     session.get(WEREAD_URL)
-    latest_sort = get_sort()
+    
     books = get_notebooklist()
-    if books != None:
-        for index, book in enumerate(books):
-            sort = book["sort"]
-            if sort <= latest_sort:
+    if books:
+        print(f"\n📚 发现 {len(books)} 本书籍\n")
+        
+        for index, book_data in enumerate(books):
+            print(f"\n[{index + 1}/{len(books)}]")
+            try:
+                sync_book(book_data)
+            except Exception as e:
+                print(f"    ❌ 同步失败: {e}")
                 continue
-            book = book.get("book")
-            title = book.get("title")
-            cover = book.get("cover").replace("/s_", "/t7_")
-            bookId = book.get("bookId")
-            author = book.get("author")
-            categories = book.get("categories")
-            if categories != None:
-                categories = [x["title"] for x in categories]
-            print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            check(bookId)
-            isbn, rating = get_bookinfo(bookId)
-            id = insert_to_notion(
-                title, bookId, cover, sort, author, isbn, rating, categories
-            )
-            chapter = get_chapter_info(bookId)
-            bookmark_list = get_bookmark_list(bookId)
-            summary, reviews = get_review_list(bookId)
-            bookmark_list.extend(reviews)
-            bookmark_list = sorted(
-                bookmark_list,
-                key=lambda x: (
-                    x.get("chapterUid", 1),
-                    (
-                        0
-                        if (
-                            x.get("range", "") == ""
-                            or x.get("range").split("-")[0] == ""
-                        )
-                        else int(x.get("range").split("-")[0])
-                    ),
-                ),
-            )
-            children, grandchild = get_children(chapter, summary, bookmark_list)
-            results = add_children(id, children)
-            if len(grandchild) > 0 and results != None:
-                add_grandchild(grandchild, results)
+            time.sleep(0.5)
+        
+        print("\n" + "=" * 50)
+        print("✅ 同步完成!")
+        print("=" * 50)
+    else:
+        print("❌ 未能获取书籍列表，请检查Cookie是否有效")
