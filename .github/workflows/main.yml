@@ -11,19 +11,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15  # 设置超时时间，避免长时间运行
     env:
-      # Notion 相关配置（必需）
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      # Notion 数据库 ID（可选，代码中有默认值）
-      BOOK_DATABASE_ID: ${{ secrets.BOOK_DATABASE_ID }}
-      NOTE_DATABASE_ID: ${{ secrets.NOTE_DATABASE_ID }}
-      INFO_DATABASE_ID: ${{ secrets.INFO_DATABASE_ID }}
-      # 微信读书 Cookie 配置（二选一）
+      NOTION_PAGE: ${{ secrets.NOTION_PAGE }}
+      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
       WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
-      # Cookie Cloud 配置（如果使用 Cookie Cloud，可选）
       CC_URL: ${{ secrets.CC_URL }}
       CC_ID: ${{ secrets.CC_ID }}
       CC_PASSWORD: ${{ secrets.CC_PASSWORD }}
-    
+      YEAR: ${{ vars.YEAR }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
